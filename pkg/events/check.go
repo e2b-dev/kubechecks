@@ -60,6 +60,7 @@ type CheckEvent struct {
 	aiNote      *msg.Message // separate comment for AI review
 
 	affectedItems affected_apps.AffectedItems
+	appSetResults map[string][]msg.Result // keyed by comment section name, reported once the note exists
 
 	ctr             container.Container
 	repoManager     repoManager
@@ -163,9 +164,10 @@ func (ce *CheckEvent) GenerateListOfAffectedApps(ctx context.Context, repo *git.
 		ce.logger.Error().Caller().Err(err).Msg("could not get list of affected apps and appsets")
 	}
 	for _, appSet := range ce.affectedItems.ApplicationSets {
-		apps, err := ce.generator.GenerateApplicationSetApps(ctx, appSet, &ce.ctr)
+		apps, err := ce.generateAppSetApps(ctx, appSet)
 		if err != nil {
-			ce.logger.Error().Caller().Err(err).Msg("could not generate apps from appSet")
+			ce.recordAppSetError(appSet, err)
+			ce.logger.Error().Caller().Err(err).Str("appset", appSet.Name).Msg("could not generate apps from appSet")
 			continue
 		}
 
@@ -378,6 +380,8 @@ func (ce *CheckEvent) Process(ctx context.Context) (retErr error) {
 		return errors.Wrap(err, "failed to create note")
 	}
 
+	ce.reportAppSetResults(ctx)
+
 	// Create a separate placeholder comment for AI review
 	if ce.ctr.Config.EnableAIReview {
 		ce.aiNote, err = ce.createAIReviewNote(ctx)
@@ -513,6 +517,83 @@ func (ce *CheckEvent) postReport(ctx context.Context, start time.Time) error {
 	})
 
 	return ce.ctr.VcsClient.UpdateMessage(ctx, ce.pullRequest, ce.vcsNote.NoteID, chunks)
+}
+
+// appSetPanicError marks an error that was recovered from a panic, so it can be reported as such.
+type appSetPanicError struct {
+	value any
+}
+
+func (e appSetPanicError) Error() string {
+	return fmt.Sprintf("panic: %v", e.value)
+}
+
+// generateAppSetApps runs the generator for one ApplicationSet. Generation is delegated to Argo CD's
+// library, so a panic in it is turned into an error for that appset rather than crashing the check.
+func (ce *CheckEvent) generateAppSetApps(ctx context.Context, appSet v1alpha1.ApplicationSet) (apps []v1alpha1.Application, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			ce.logger.Error().Caller().Any("error", r).Str("appset", appSet.Name).
+				Str("stack", string(debug.Stack())).Msg("panic while generating apps from appSet")
+			apps, err = nil, appSetPanicError{value: r}
+		}
+	}()
+
+	return ce.generator.GenerateApplicationSetApps(ctx, appSet, &ce.ctr)
+}
+
+// recordAppSetError stores a generation error for an ApplicationSet, so it can be reported in the PR
+// comment once it has been created. An unsupported generator is reported as a warning, since it is a
+// limitation of kubechecks rather than a problem with the PR.
+func (ce *CheckEvent) recordAppSetError(appSet v1alpha1.ApplicationSet, err error) {
+	result := msg.Result{
+		State:   pkg.StateError,
+		Summary: "ApplicationSet generation failed",
+		Details: fmt.Sprintf("```\n%s\n```", err),
+	}
+
+	var unsupportedErr generator.UnsupportedGeneratorError
+	var panicErr appSetPanicError
+	switch {
+	case errors.As(err, &panicErr):
+		desc := "generating applications from ApplicationSet"
+		result = msg.Result{
+			State:   pkg.StatePanic,
+			Summary: "ApplicationSet generation panicked",
+			Details: fmt.Sprintf(errorCommentFormat, desc, panicErr.value),
+		}
+	case errors.As(err, &unsupportedErr):
+		result = msg.Result{
+			State:   pkg.StateWarning,
+			Summary: fmt.Sprintf("Unsupported generator: %s", unsupportedErr.Generator),
+			Details: fmt.Sprintf("kubechecks cannot evaluate the %s generator, so the applications this ApplicationSet generates were not checked.", unsupportedErr.Generator),
+		}
+	}
+
+	if ce.appSetResults == nil {
+		ce.appSetResults = make(map[string][]msg.Result)
+	}
+	section := appSetSectionName(appSet)
+	ce.appSetResults[section] = append(ce.appSetResults[section], result)
+}
+
+// appSetSectionName names an ApplicationSet's section in the PR comment. It is qualified with the namespace
+// so that ApplicationSets sharing a name across namespaces get separate sections.
+func appSetSectionName(appSet v1alpha1.ApplicationSet) string {
+	name := appSet.Name
+	if appSet.Namespace != "" {
+		name = appSet.Namespace + "/" + name
+	}
+	return fmt.Sprintf("%s (ApplicationSet)", name)
+}
+
+func (ce *CheckEvent) reportAppSetResults(ctx context.Context) {
+	for section, results := range ce.appSetResults {
+		ce.vcsNote.AddNewApp(ctx, section)
+		for _, result := range results {
+			ce.vcsNote.AddToAppMessage(ctx, section, result)
+		}
+	}
 }
 
 func (ce *CheckEvent) removeApp(app v1alpha1.Application) {
