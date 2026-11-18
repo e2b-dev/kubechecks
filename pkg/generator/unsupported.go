@@ -27,9 +27,12 @@ var generatorNames = func() []string {
 	return names
 }()
 
-// withUnsupportedGenerators registers a stub for every generator type missing from generators,
-// leaving the ones that were provided untouched.
+// withUnsupportedGenerators registers the sample PullRequest generator and a stub for every other generator
+// type missing from generators, leaving the ones that were provided untouched.
 func withUnsupportedGenerators(generators map[string]argogenerator.Generator) map[string]argogenerator.Generator {
+	if _, ok := generators["PullRequest"]; !ok {
+		generators["PullRequest"] = samplePullRequestGenerator{}
+	}
 	for _, name := range generatorNames {
 		if _, ok := generators[name]; !ok {
 			generators[name] = unsupportedGenerator{name: name}

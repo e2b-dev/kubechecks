@@ -29,7 +29,7 @@ func TestGenerateListOfAffectedApps_RecoversGeneratorPanic(t *testing.T) {
 	gen.On("GenerateApplicationSetApps", mock.Anything, mock.MatchedBy(func(a v1alpha1.ApplicationSet) bool { return a.Name == "broken" }), mock.Anything).
 		Run(func(mock.Arguments) { panic("nil pointer dereference") })
 	gen.On("GenerateApplicationSetApps", mock.Anything, mock.MatchedBy(func(a v1alpha1.ApplicationSet) bool { return a.Name == "working" }), mock.Anything).
-		Return([]v1alpha1.Application{{ObjectMeta: metav1.ObjectMeta{Name: "app1"}}}, nil)
+		Return(generator.AppSetResult{Apps: []v1alpha1.Application{{ObjectMeta: metav1.ObjectMeta{Name: "app1"}}}}, nil)
 
 	matcher := new(affectedappsmocks.MockMatcher)
 	matcher.On("AffectedApps", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(affected_apps.AffectedItems{
@@ -53,10 +53,10 @@ func TestGenerateListOfAffectedApps_RecoversGeneratorPanic(t *testing.T) {
 	assert.NotContains(t, ce.appSetResults, "working (ApplicationSet)")
 }
 
-func TestRecordAppSetError(t *testing.T) {
+func TestRecordAppSetResult(t *testing.T) {
 	t.Run("a generation error fails the check", func(t *testing.T) {
 		ce := &CheckEvent{}
-		ce.recordAppSetError(appSetNamed("orbit"), errors.New("error parsing label selector"))
+		ce.recordAppSetResult(appSetNamed("orbit"), generator.AppSetResult{}, errors.New("error parsing label selector"))
 
 		results := ce.appSetResults["orbit (ApplicationSet)"]
 		require.Len(t, results, 1)
@@ -64,10 +64,39 @@ func TestRecordAppSetError(t *testing.T) {
 		assert.Contains(t, results[0].Details, "error parsing label selector")
 	})
 
+	t.Run("previews and partial errors are both reported", func(t *testing.T) {
+		ce := &CheckEvent{}
+		ce.recordAppSetResult(appSetNamed("orbit-preview"), generator.AppSetResult{
+			Previews: []v1alpha1.Application{{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "argoproj.io/v1alpha1", Kind: "Application"},
+				ObjectMeta: metav1.ObjectMeta{Name: "orbit-pr-1234", Namespace: "argocd"},
+				Spec:       v1alpha1.ApplicationSpec{Project: "default"},
+			}},
+		}, errors.New("generated application \"Bad\" is invalid"))
+
+		results := ce.appSetResults["orbit-preview (ApplicationSet)"]
+		require.Len(t, results, 2)
+
+		assert.Equal(t, pkg.StateError, results[0].State)
+		assert.Contains(t, results[0].Details, `"Bad" is invalid`)
+
+		assert.Equal(t, pkg.StateSuccess, results[1].State)
+		assert.Contains(t, results[1].Details, "name: orbit-pr-1234")
+		assert.Contains(t, results[1].Details, "project: default")
+		assert.NotContains(t, results[1].Details, "status:")
+		assert.NotContains(t, results[1].Details, "creationTimestamp")
+	})
+
+	t.Run("an appset that only produced real apps is not reported", func(t *testing.T) {
+		ce := &CheckEvent{}
+		ce.recordAppSetResult(appSetNamed("plain"), generator.AppSetResult{Apps: []v1alpha1.Application{{}}}, nil)
+		assert.Empty(t, ce.appSetResults)
+	})
+
 	t.Run("an unsupported generator is only a warning", func(t *testing.T) {
 		ce := &CheckEvent{}
 		err := fmt.Errorf("error generating applications: %w", generator.UnsupportedGeneratorError{Generator: "Git"})
-		ce.recordAppSetError(appSetNamed("orbit"), err)
+		ce.recordAppSetResult(appSetNamed("orbit"), generator.AppSetResult{}, err)
 
 		results := ce.appSetResults["orbit (ApplicationSet)"]
 		require.Len(t, results, 1)
@@ -80,7 +109,7 @@ func TestRecordAppSetError(t *testing.T) {
 		for _, ns := range []string{"team-a", "team-b"} {
 			appSet := appSetNamed("orbit")
 			appSet.Namespace = ns
-			ce.recordAppSetError(appSet, errors.New("boom"))
+			ce.recordAppSetResult(appSet, generator.AppSetResult{}, errors.New("boom"))
 		}
 
 		assert.Len(t, ce.appSetResults["team-a/orbit (ApplicationSet)"], 1)

@@ -19,6 +19,7 @@ import (
 	"github.com/zapier/kubechecks/pkg/repo_config"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"sigs.k8s.io/yaml"
 
 	"github.com/zapier/kubechecks/pkg"
 	"github.com/zapier/kubechecks/pkg/affected_apps"
@@ -164,10 +165,13 @@ func (ce *CheckEvent) GenerateListOfAffectedApps(ctx context.Context, repo *git.
 		ce.logger.Error().Caller().Err(err).Msg("could not get list of affected apps and appsets")
 	}
 	for _, appSet := range ce.affectedItems.ApplicationSets {
-		apps, err := ce.generateAppSetApps(ctx, appSet)
+		generated, err := ce.generateAppSetApps(ctx, appSet)
+		ce.recordAppSetResult(appSet, generated, err)
 		if err != nil {
-			ce.recordAppSetError(appSet, err)
 			ce.logger.Error().Caller().Err(err).Str("appset", appSet.Name).Msg("could not generate apps from appSet")
+		}
+		apps := generated.Apps
+		if len(apps) == 0 {
 			continue
 		}
 
@@ -347,8 +351,6 @@ func (ce *CheckEvent) Process(ctx context.Context) (retErr error) {
 		Str("base_ref", ce.pullRequest.BaseRef).
 		Msg("archived repo stored in clonedRepos under multiple keys (HeadRef, BaseRef, HEAD)")
 	ce.repoLock.Unlock()
-
-
 
 	// Get changed files from VCS API (replaces git diff)
 	ce.fileList, err = ce.ctr.ArchiveManager.GetChangedFiles(ctx, ce.pullRequest)
@@ -530,51 +532,102 @@ func (e appSetPanicError) Error() string {
 
 // generateAppSetApps runs the generator for one ApplicationSet. Generation is delegated to Argo CD's
 // library, so a panic in it is turned into an error for that appset rather than crashing the check.
-func (ce *CheckEvent) generateAppSetApps(ctx context.Context, appSet v1alpha1.ApplicationSet) (apps []v1alpha1.Application, err error) {
+func (ce *CheckEvent) generateAppSetApps(ctx context.Context, appSet v1alpha1.ApplicationSet) (result generator.AppSetResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			ce.logger.Error().Caller().Any("error", r).Str("appset", appSet.Name).
 				Str("stack", string(debug.Stack())).Msg("panic while generating apps from appSet")
-			apps, err = nil, appSetPanicError{value: r}
+			result, err = generator.AppSetResult{}, appSetPanicError{value: r}
 		}
 	}()
 
 	return ce.generator.GenerateApplicationSetApps(ctx, appSet, &ce.ctr)
 }
 
-// recordAppSetError stores a generation error for an ApplicationSet, so it can be reported in the PR
-// comment once it has been created. An unsupported generator is reported as a warning, since it is a
-// limitation of kubechecks rather than a problem with the PR.
-func (ce *CheckEvent) recordAppSetError(appSet v1alpha1.ApplicationSet, err error) {
-	result := msg.Result{
-		State:   pkg.StateError,
-		Summary: "ApplicationSet generation failed",
-		Details: fmt.Sprintf("```\n%s\n```", err),
-	}
+// recordAppSetResult stores generation errors and sample-param previews for an ApplicationSet, so they
+// can be reported in the PR comment once it has been created. An unsupported generator is reported as a
+// warning, since it is a limitation of kubechecks rather than a problem with the PR.
+func (ce *CheckEvent) recordAppSetResult(appSet v1alpha1.ApplicationSet, generated generator.AppSetResult, err error) {
+	var results []msg.Result
 
 	var unsupportedErr generator.UnsupportedGeneratorError
 	var panicErr appSetPanicError
 	switch {
 	case errors.As(err, &panicErr):
 		desc := "generating applications from ApplicationSet"
-		result = msg.Result{
+		results = append(results, msg.Result{
 			State:   pkg.StatePanic,
 			Summary: "ApplicationSet generation panicked",
 			Details: fmt.Sprintf(errorCommentFormat, desc, panicErr.value),
-		}
+		})
 	case errors.As(err, &unsupportedErr):
-		result = msg.Result{
+		results = append(results, msg.Result{
 			State:   pkg.StateWarning,
 			Summary: fmt.Sprintf("Unsupported generator: %s", unsupportedErr.Generator),
 			Details: fmt.Sprintf("kubechecks cannot evaluate the %s generator, so the applications this ApplicationSet generates were not checked.", unsupportedErr.Generator),
-		}
+		})
+	case err != nil:
+		results = append(results, msg.Result{
+			State:   pkg.StateError,
+			Summary: "ApplicationSet generation failed",
+			Details: fmt.Sprintf("```\n%s\n```", err),
+		})
 	}
 
+	if len(generated.Previews) > 0 {
+		var details strings.Builder
+		details.WriteString("This ApplicationSet uses a generator that kubechecks cannot evaluate, so its template was rendered with sample parameters. These Applications are shown for review only and were not diffed or validated against their manifests.\n")
+		for _, app := range generated.Previews {
+			manifest, yamlErr := yaml.Marshal(previewManifest(app))
+			if yamlErr != nil {
+				manifest = []byte(yamlErr.Error())
+			}
+			fmt.Fprintf(&details, "\n```yaml\n%s```\n", manifest)
+		}
+		results = append(results, msg.Result{
+			State:   pkg.StateSuccess,
+			Summary: "ApplicationSet template rendered with sample parameters",
+			Details: details.String(),
+		})
+	}
+
+	if len(results) == 0 {
+		return
+	}
 	if ce.appSetResults == nil {
 		ce.appSetResults = make(map[string][]msg.Result)
 	}
 	section := appSetSectionName(appSet)
-	ce.appSetResults[section] = append(ce.appSetResults[section], result)
+	ce.appSetResults[section] = append(ce.appSetResults[section], results...)
+}
+
+// previewManifest keeps only what an ApplicationSet template produces, dropping the empty status and
+// server-populated metadata that would otherwise clutter the comment.
+func previewManifest(app v1alpha1.Application) any {
+	type metadata struct {
+		Name        string            `json:"name"`
+		Namespace   string            `json:"namespace,omitempty"`
+		Labels      map[string]string `json:"labels,omitempty"`
+		Annotations map[string]string `json:"annotations,omitempty"`
+		Finalizers  []string          `json:"finalizers,omitempty"`
+	}
+	return struct {
+		APIVersion string                   `json:"apiVersion"`
+		Kind       string                   `json:"kind"`
+		Metadata   metadata                 `json:"metadata"`
+		Spec       v1alpha1.ApplicationSpec `json:"spec"`
+	}{
+		APIVersion: app.APIVersion,
+		Kind:       app.Kind,
+		Metadata: metadata{
+			Name:        app.Name,
+			Namespace:   app.Namespace,
+			Labels:      app.Labels,
+			Annotations: app.Annotations,
+			Finalizers:  app.Finalizers,
+		},
+		Spec: app.Spec,
+	}
 }
 
 // appSetSectionName names an ApplicationSet's section in the PR comment. It is qualified with the namespace
@@ -799,4 +852,3 @@ func buildRawReviewBody(appReviews map[string]string) string {
 
 // extractRepoCRDSchemas collects kubeconform schemas from the CustomResourceDefinitions
 // in the checkout. Failing to do so is not fatal: without them, custom resources
-

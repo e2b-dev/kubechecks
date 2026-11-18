@@ -318,7 +318,7 @@ func TestCheckEvent_GenerateListOfAffectedApps(t *testing.T) {
 				addedAppsSet:  nil,
 				appsSent:      0,
 				appChannel:    nil,
-				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{[]v1alpha1.Application{}, nil}),
+				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{generator.AppSetResult{}, nil}),
 				matcher: MockMatcher("AffectedApps", []interface{}{
 					affected_apps.AffectedItems{
 						ApplicationSets: []v1alpha1.ApplicationSet{
@@ -355,7 +355,7 @@ func TestCheckEvent_GenerateListOfAffectedApps(t *testing.T) {
 				addedAppsSet:  nil,
 				appsSent:      0,
 				appChannel:    nil,
-				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{[]v1alpha1.Application{}, nil}),
+				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{generator.AppSetResult{}, nil}),
 				matcher: MockMatcher("AffectedApps", []interface{}{
 					affected_apps.AffectedItems{},
 					fmt.Errorf("mock error"),
@@ -385,7 +385,7 @@ func TestCheckEvent_GenerateListOfAffectedApps(t *testing.T) {
 				addedAppsSet:  nil,
 				appsSent:      0,
 				appChannel:    nil,
-				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{[]v1alpha1.Application{}, fmt.Errorf("mock error")}),
+				generator:     MockGenerator("GenerateApplicationSetApps", []interface{}{generator.AppSetResult{}, fmt.Errorf("mock error")}),
 				matcher: MockMatcher("AffectedApps", []interface{}{
 					affected_apps.AffectedItems{
 						ApplicationSets: []v1alpha1.ApplicationSet{
