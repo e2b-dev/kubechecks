@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -295,4 +298,86 @@ func TestNotifyDroppedRequests_StopsAtShutdownDeadline(t *testing.T) {
 	assert.Less(t, time.Since(start), droppedRequestTimeout, "cleanup must not outlive the shutdown context")
 	assert.LessOrEqual(t, int(statusCalls.Load()), droppedRequestConcurrency, "no status call may start after the shutdown context is done")
 	vcsClient.AssertNotCalled(t, "PostMessage", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// A check that outlives its timeout is abandoned at the timeout. One that
+// finishes is not, however long ago it ran: its timer must not fire later.
+func TestProcessRequest_AbandonsOnlyACheckThatOutlivesItsTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		vcsClient := vcsmocks.NewMockClient(t)
+		vcsClient.EXPECT().CommitStatus(mock.Anything, mock.Anything, pkg.StateRunning).Return(nil).Times(2)
+		ctr := container.Container{VcsClient: vcsClient}
+
+		abandoned := make(chan int, 1)
+		wasAbandoned := func() (int, bool) {
+			synctest.Wait()
+			select {
+			case id := <-abandoned:
+				return id, true
+			default:
+				return 0, false
+			}
+		}
+		stuck := make(chan struct{})
+		rq := &RepoQueue{
+			processFunc: func(_ context.Context, pr vcs.PullRequest, _ container.Container, _ []checks.ProcessorEntry, _ AIReviewChecker) error {
+				if pr.CheckID == 2 {
+					<-stuck
+				}
+				return nil
+			},
+			abandon: func(request *CheckRequest) { abandoned <- request.PullRequest.CheckID },
+		}
+
+		rq.processRequest(queuedRequest(ctr, testPullRequest(1, "aaa")))
+		time.Sleep(2 * checkTimeout)
+		_, yes := wasAbandoned()
+		require.False(t, yes, "a check that finished was abandoned afterwards")
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			rq.processRequest(queuedRequest(ctr, testPullRequest(2, "bbb")))
+		}()
+		time.Sleep(checkTimeout - time.Second)
+		_, yes = wasAbandoned()
+		assert.False(t, yes, "a check was abandoned before its timeout")
+		time.Sleep(2 * time.Second)
+		id, yes := wasAbandoned()
+		assert.True(t, yes, "a check that outlived its timeout was not abandoned")
+		assert.Equal(t, 2, id)
+
+		close(stuck)
+		<-done
+	})
+}
+
+// abandonCheck has to end the process, which a test cannot survive: it runs
+// in a copy of the test binary, and the test reads what the copy left behind.
+func TestAbandonCheck_WritesEveryStackAndExits(t *testing.T) {
+	const inChild = "KUBECHECKS_TEST_ABANDON_CHECK"
+	if os.Getenv(inChild) != "" {
+		parked := make(chan struct{})
+		go parkedForTheStackDump(parked)
+		<-parked
+		abandonCheck(queuedRequest(container.Container{}, testPullRequest(7, "ccc")))
+		return
+	}
+
+	child := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestAbandonCheck_WritesEveryStackAndExits$")
+	child.Env = append(os.Environ(), inChild+"=1")
+	output, err := child.CombinedOutput()
+
+	var exit *exec.ExitError
+	require.ErrorAs(t, err, &exit, "the process did not exit with an error: %s", output)
+	assert.Equal(t, 1, exit.ExitCode())
+	assert.Contains(t, string(output), "parkedForTheStackDump", "the dump lacks the stack of another goroutine")
+	assert.Contains(t, string(output), "check did not finish in time")
+}
+
+// parkedForTheStackDump waits for ever, so that its frame is in a dump of
+// every goroutine and in no dump of the calling one alone.
+func parkedForTheStackDump(parked chan<- struct{}) {
+	close(parked)
+	select {}
 }

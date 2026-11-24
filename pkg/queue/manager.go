@@ -3,6 +3,8 @@ package queue
 import (
 	"context"
 	"fmt"
+	"os"
+	"runtime/pprof"
 	"sync"
 	"time"
 
@@ -52,6 +54,9 @@ type RepoQueue struct {
 	processed   int
 	processFunc ProcessFunc
 
+	// abandon is called with a check that outlived checkTimeout.
+	abandon func(*CheckRequest)
+
 	// stopCtx is set before done is closed and bounds shutdown cleanup.
 	stopCtx context.Context
 }
@@ -79,6 +84,31 @@ const (
 	// droppedRequestConcurrency caps parallel VCS calls during shutdown cleanup.
 	droppedRequestConcurrency = 10
 )
+
+// checkTimeout bounds one check, from the moment the worker picks it up. It is
+// well above the budgets of the steps inside a check (5 minutes for an AI
+// review, 10 for publishing a long report), so a check that outlives it is
+// taken to be stuck in a call that takes no deadline. Such a check holds the
+// repository's only worker until the process ends.
+const checkTimeout = 30 * time.Minute
+
+// abandonCheck ends the process when a check outlives checkTimeout, after
+// writing every goroutine's stack so the log shows where the check hung. Only
+// a restart frees the worker: the calls a check can hang in cannot be
+// cancelled. Every repository's queue and running check is lost with the
+// process.
+func abandonCheck(request *CheckRequest) {
+	// The exit must not wait on the log streams: a blocked one may be what
+	// the check is stuck on.
+	time.AfterFunc(time.Minute, func() { os.Exit(1) })
+
+	_ = pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
+	log.Fatal().
+		Str("repo", request.PullRequest.CloneURL).
+		Int("check_id", request.PullRequest.CheckID).
+		Dur("timeout", checkTimeout).
+		Msg("check did not finish in time, exiting to free the worker")
+}
 
 // Config holds queue manager configuration
 type Config struct {
@@ -134,6 +164,7 @@ func (qm *QueueManager) Enqueue(ctx context.Context, params EnqueueParams) error
 				done:        make(chan struct{}),
 				queuedAt:    time.Now(),
 				processFunc: qm.processFunc,
+				abandon:     abandonCheck,
 			}
 			qm.queues[repoKey] = queue
 
@@ -354,6 +385,8 @@ func droppedLogger(request *CheckRequest) *zerolog.Logger {
 
 // processRequest handles a single check request
 func (rq *RepoQueue) processRequest(request *CheckRequest) {
+	watchdog := time.AfterFunc(checkTimeout, func() { rq.abandon(request) })
+
 	start := time.Now()
 	timer := prometheus.NewTimer(repoWorkerProcessingDuration)
 	defer timer.ObserveDuration()
@@ -375,6 +408,9 @@ func (rq *RepoQueue) processRequest(request *CheckRequest) {
 		request.Processors,
 		request.AIReviewChecker,
 	)
+	// Stopped as soon as the check returns: the bookkeeping below is not part
+	// of what the timeout bounds.
+	watchdog.Stop()
 	if err != nil {
 		repoWorkerRequestsFailed.Inc()
 		log.Error().
