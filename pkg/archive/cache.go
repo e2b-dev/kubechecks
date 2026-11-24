@@ -80,14 +80,17 @@ func NewCache(cfg Config) *Cache {
 // singleflight call — concurrent callers for the same SHA are still coalesced
 // per attempt, they just don't wait through each other's backoff windows.
 func (c *Cache) GetOrDownload(ctx context.Context, archiveURL, mergeCommitSHA string, authHeaders map[string]string) (string, error) {
-	// Fast path: check cache before entering the retry loop.
-	c.lock.RLock()
+	// Fast path: check cache before entering the retry loop. The archive is
+	// marked used under the lock, so the cleanup cannot remove it in between.
+	c.lock.Lock()
 	entry, exists := c.entries[mergeCommitSHA]
-	c.lock.RUnlock()
 	if exists {
-		archiveCacheHits.Inc()
 		atomic.AddInt32(&entry.refCount, 1)
 		entry.lastUsed = time.Now()
+	}
+	c.lock.Unlock()
+	if exists {
+		archiveCacheHits.Inc()
 		log.Debug().
 			Caller().
 			Str("archive_url", archiveURL).
@@ -138,13 +141,15 @@ func (c *Cache) GetOrDownload(ctx context.Context, archiveURL, mergeCommitSHA st
 		start := time.Now()
 		result, err, shared := c.downloadGroup.Do(mergeCommitSHA, func() (interface{}, error) {
 			// Re-check cache — another caller may have populated it while we waited.
-			c.lock.RLock()
+			c.lock.Lock()
 			entry, exists := c.entries[mergeCommitSHA]
-			c.lock.RUnlock()
 			if exists {
-				archiveCacheHits.Inc()
 				atomic.AddInt32(&entry.refCount, 1)
 				entry.lastUsed = time.Now()
+			}
+			c.lock.Unlock()
+			if exists {
+				archiveCacheHits.Inc()
 				return entry.extractedPath, nil
 			}
 
@@ -261,7 +266,9 @@ func (c *Cache) startCleanupRoutine() {
 	}
 }
 
-// cleanupStaleArchives removes archives that haven't been used recently
+// cleanupStaleArchives removes archives that no check has taken for longer
+// than the TTL. The reference count is not consulted: nothing releases an
+// archive, so it never returns to zero.
 func (c *Cache) cleanupStaleArchives() {
 	log.Debug().Caller().Msg("starting cleanup of stale archives")
 
@@ -272,11 +279,6 @@ func (c *Cache) cleanupStaleArchives() {
 	var removed int
 
 	for key, entry := range c.entries {
-		// Skip if archive is currently in use
-		if atomic.LoadInt32(&entry.refCount) > 0 {
-			continue
-		}
-
 		// Check if archive is stale
 		if now.Sub(entry.lastUsed) > c.ttl {
 			log.Info().
@@ -284,9 +286,11 @@ func (c *Cache) cleanupStaleArchives() {
 				Dur("unused_for", now.Sub(entry.lastUsed)).
 				Msg("removing stale archive from cache")
 
-			// Remove from disk
-			if err := os.RemoveAll(entry.extractedPath); err != nil {
-				log.Warn().Err(err).Str("path", entry.extractedPath).Msg("failed to remove archive directory")
+			// Remove the commit's whole directory from disk: the extracted
+			// path is usually a level below it.
+			dir := filepath.Join(c.baseDir, key)
+			if err := os.RemoveAll(dir); err != nil {
+				log.Warn().Err(err).Str("path", dir).Msg("failed to remove archive directory")
 			}
 
 			delete(c.entries, key)

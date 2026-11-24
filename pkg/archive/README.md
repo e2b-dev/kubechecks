@@ -124,8 +124,7 @@ func (c *Cache) Release(archiveURL, mergeCommitSHA string)
 - **Cache key**: Merge commit SHA (immutable, globally unique)
 - **Cache hit**: Returns path instantly (no download)
 - **Cache miss**: Downloads, extracts, caches, then returns path
-- **Reference counting**: Archives in use are never cleaned up
-- **TTL cleanup**: Runs every 15 minutes, removes unused archives
+- **TTL cleanup**: Runs every 15 minutes and removes every archive no check has taken for longer than the TTL. An archive is not held while a check reads it, so keep the TTL above the longest check
 
 ### Downloader
 
