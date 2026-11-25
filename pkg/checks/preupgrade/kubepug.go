@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/kubepug/kubepug/lib"
@@ -59,10 +63,26 @@ func checkApp(ctx context.Context, ctr container.Container, appName, targetKuber
 		return msg.Result{}, err
 	}
 
+	// kubepug downloads a store given as a URL into a temporary directory that
+	// it never removes, so it gets a local copy that is removed here.
+	generatedStore := ctr.Config.KubepugGeneratedStore
+	if location, err := url.Parse(generatedStore); err == nil && (location.Scheme == "http" || location.Scheme == "https") {
+		storeDir, err := os.MkdirTemp("", "kubechecks-kubepug-store-*")
+		if err != nil {
+			return msg.Result{}, fmt.Errorf("failed to create temporary directory: %w", err)
+		}
+		defer pkg.WipeDir(storeDir)
+
+		generatedStore = filepath.Join(storeDir, "data.json")
+		if err := download(ctx, location.String(), generatedStore); err != nil {
+			return msg.Result{}, fmt.Errorf("failed to download the kubepug store: %w", err)
+		}
+	}
+
 	config := lib.Config{
 		K8sVersion:     fmt.Sprintf("v%s", nextVersion.String()),
 		Input:          tempDir,
-		GeneratedStore: ctr.Config.KubepugGeneratedStore,
+		GeneratedStore: generatedStore,
 	}
 
 	kubepug, err := lib.NewKubepug(&config)
@@ -179,6 +199,36 @@ func checkApp(ctx context.Context, ctr container.Container, appName, targetKuber
 			strings.Join(outputString, "\n"),
 		),
 	}, nil
+}
+
+// download writes what location serves to file.
+func download(ctx context.Context, location, file string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, location, nil)
+	if err != nil {
+		return err
+	}
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := response.Body.Close(); closeErr != nil {
+			log.Warn().Err(closeErr).Msg("failed to close response body")
+		}
+	}()
+
+	// The statuses kubepug's own download refuses.
+	if response.StatusCode > http.StatusUseProxy {
+		return fmt.Errorf("%s answered %s", location, response.Status)
+	}
+
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(file, data, 0o600)
 }
 
 func checkStatus(result *results.Result) pkg.CommitState {
