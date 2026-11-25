@@ -324,6 +324,7 @@ func (a *ArgoClient) generateManifests(ctx context.Context, app v1alpha1.Applica
 			if err != nil {
 				return nil, errors.Wrap(err, "failed to package application")
 			}
+			defer pkg.WipeDir(packageDir)
 		}
 	}
 
@@ -338,6 +339,7 @@ func (a *ArgoClient) generateManifests(ctx context.Context, app v1alpha1.Applica
 	if err != nil {
 		return nil, fmt.Errorf("failed to compress files: %w", err)
 	}
+	defer tgzstream.CloseAndDelete(f)
 	log.Debug().Caller().Str("app", app.Name).Msgf("%d files compressed", filesWritten)
 	//if filesWritten == 0 {
 	//	return nil, fmt.Errorf("no files to send")
@@ -594,6 +596,12 @@ func packageApp(
 	if err != nil {
 		return "", errors.Wrap(err, "failed to make temp dir")
 	}
+	packaged := false
+	defer func() {
+		if !packaged {
+			pkg.WipeDir(destDir)
+		}
+	}()
 
 	fsIface := filesys.MakeFsOnDisk()
 
@@ -688,6 +696,8 @@ func packageApp(
 			}
 		}
 	}
+
+	packaged = true
 
 	return destDir, nil
 }
