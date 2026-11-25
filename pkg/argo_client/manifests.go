@@ -589,6 +589,7 @@ func copyFile(srcpath, dstpath string) error {
 
 // processLocalHelmDependency handles copying local helm dependencies to the temp directory
 func processLocalHelmDependency(
+	roots packageRoots,
 	srcAppPath string,
 	destAppDir string,
 	dependencyPath string,
@@ -601,6 +602,12 @@ func processLocalHelmDependency(
 
 	// Create the destination path in the temp directory
 	destDepPath := filepath.Join(destAppDir, cleanPath)
+	if err := roots.check(absDepPath, destDepPath); err != nil {
+		return err
+	}
+	if err := linksInsideRepo(absDepPath, roots.repo); err != nil {
+		return err
+	}
 
 	// Create the charts directory if it doesn't exist
 	if err := os.MkdirAll(destDepPath, os.ModePerm); err != nil {
@@ -666,7 +673,13 @@ func packageApp(
 
 	destAppDir := filepath.Join(destDir, source.Path)
 	srcAppPath := filepath.Join(repo.Directory, source.Path)
-	sourceFS := os.DirFS(repo.Directory)
+	roots := packageRoots{repo: repo.Directory, pkg: destDir}
+	if err := roots.check(srcAppPath, destAppDir); err != nil {
+		return "", err
+	}
+	if err := linksInsideRepo(srcAppPath, repo.Directory); err != nil {
+		return "", err
+	}
 
 	// First copy the entire source directory
 	if err := copyDir(fsIface, srcAppPath, destAppDir); err != nil {
@@ -677,7 +690,15 @@ func packageApp(
 	relKustPath := filepath.Join(source.Path, "kustomization.yaml")
 	absKustPath := filepath.Join(destDir, relKustPath)
 	if fsIface.Exists(absKustPath) {
-		files, _, err := kustomize.ProcessKustomizationFile(sourceFS, relKustPath)
+		// The scanner opens the directories a kustomization names, links
+		// included, so it reads through a root that it cannot leave.
+		repoRoot, err := os.OpenRoot(repo.Directory)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to open the repository")
+		}
+		defer pkg.WithErrorLogging(repoRoot.Close, "failed to close the repository")
+
+		files, _, err := kustomize.ProcessKustomizationFile(repoRoot.FS(), relKustPath)
 		if err != nil {
 			return "", errors.Wrap(err, "failed to process kustomization dependencies")
 		}
@@ -703,7 +724,7 @@ func packageApp(
 			for _, dep := range deps {
 				if strings.HasPrefix(dep.Repository, "file://") {
 					log.Debug().Caller().Str("chartPath", chartPath).Msgf("processing local helm dependency %s", dep.Repository)
-					if err := processLocalHelmDependency(srcAppPath, destAppDir, dep.Repository); err != nil {
+					if err := processLocalHelmDependency(roots, srcAppPath, destAppDir, dep.Repository); err != nil {
 						return "", errors.Wrapf(err, "failed to process local helm dependency %s", dep.Name)
 					}
 				}
@@ -748,6 +769,9 @@ func packageApp(
 
 			src := filepath.Join(srcAppPath, valueFile)
 			dst := filepath.Join(destAppDir, valueFile)
+			if err := roots.check(src, dst); err != nil {
+				return "", err
+			}
 			if err = copyFile(src, dst); err != nil {
 				if !ignoreValuesFileCopyError(source, valueFile, err) {
 					return "", errors.Wrapf(err, "failed to copy file: %q", valueFile)
@@ -792,6 +816,9 @@ func processValueReference(
 
 	src := filepath.Join(refRepo.Directory, refPath)
 	dst := filepath.Join(tempDir, ".refs", refName, refPath)
+	if err := (packageRoots{repo: refRepo.Directory, pkg: tempDir}).check(src, dst); err != nil {
+		return "", err
+	}
 	if err = copyFile(src, dst); err != nil {
 		if !ignoreValuesFileCopyError(source, valueFile, err) {
 			return "", errors.Wrapf(err, "failed to copy referenced value file: %q", valueFile)

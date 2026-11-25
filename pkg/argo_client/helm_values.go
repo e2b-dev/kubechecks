@@ -2,6 +2,8 @@ package argo_client
 
 import (
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -33,6 +35,11 @@ func copyGlobValueFiles(repoRoot, destDir, srcAppPath, destAppDir string, source
 	}
 
 	pattern := filepath.Join(srcAppPath, valueFile)
+	if inside, err := writtenInside(pattern, repoRoot); err != nil {
+		return err
+	} else if !inside {
+		return fmt.Errorf("glob value file %q escapes repo root", valueFile)
+	}
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		return errors.Wrapf(err, "failed to expand glob %q", valueFile)
@@ -109,6 +116,102 @@ func absClean(path string) (string, error) {
 		return "", err
 	}
 	return filepath.Clean(abs), nil
+}
+
+// insideRepo returns an error unless path lies inside the repository clone at
+// root: as written and, when it exists, with its symbolic links resolved.
+func insideRepo(path, root string) error {
+	inside, err := writtenInside(path, root)
+	if err != nil {
+		return err
+	}
+	if !inside {
+		return fmt.Errorf("%q is outside the repository", path)
+	}
+
+	resolvedPath, err := resolveExisting(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.Wrapf(err, "failed to resolve %q", path)
+	}
+	resolvedRoot, err := resolveExisting(root)
+	if err != nil {
+		return errors.Wrapf(err, "failed to resolve %q", root)
+	}
+	if !isWithin(resolvedPath, resolvedRoot) {
+		return fmt.Errorf("%q is outside the repository", path)
+	}
+
+	return nil
+}
+
+// linksInsideRepo returns an error if dir, a directory in the repository clone
+// at root, holds a symbolic link that leads outside the clone. Copying follows
+// links, so this is checked before a directory is copied.
+func linksInsideRepo(dir, root string) error {
+	// Walking does not enter a directory through a link, so walk what dir
+	// names, and compare what is found there with what root names.
+	resolvedDir, err := resolveExisting(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // the copy that follows reports what is missing
+	}
+	if err != nil {
+		return err
+	}
+	resolvedRoot, err := resolveExisting(root)
+	if err != nil {
+		return err
+	}
+
+	return filepath.WalkDir(resolvedDir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.Type()&fs.ModeSymlink == 0 {
+			return err
+		}
+
+		return insideRepo(path, resolvedRoot)
+	})
+}
+
+// packageRoots are the two directories packaging works between: the repository
+// clone it reads and the package directory it fills.
+type packageRoots struct {
+	repo string
+	pkg  string
+}
+
+// check returns an error unless src lies inside the clone and dst inside the
+// package directory. Each is checked on its own: a path can leave the clone
+// and come back to it by name, and the same path then leaves the package.
+func (r packageRoots) check(src, dst string) error {
+	if err := insideRepo(src, r.repo); err != nil {
+		return err
+	}
+
+	inside, err := writtenInside(dst, r.pkg)
+	if err != nil {
+		return err
+	}
+	if !inside {
+		return fmt.Errorf("%q is outside the package directory", dst)
+	}
+
+	return nil
+}
+
+// writtenInside reports whether path, as written, lies inside root.
+func writtenInside(path, root string) (bool, error) {
+	absPath, err := absClean(path)
+	if err != nil {
+		return false, err
+	}
+	absRoot, err := absClean(root)
+	if err != nil {
+		return false, err
+	}
+
+	return isWithin(absPath, absRoot), nil
 }
 
 // isWithin reports whether child is identical to parent or sits inside it.

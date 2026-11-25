@@ -975,7 +975,7 @@ spec:
 			require.NoError(t, err)
 
 			// Call the function
-			err := processLocalHelmDependency(tc.srcAppPath, tc.destAppDir, tc.dependencyPath)
+			err := processLocalHelmDependency(packageRoots{repo: sourceTempDir, pkg: destTempDir}, tc.srcAppPath, tc.destAppDir, tc.dependencyPath)
 
 			// Check error
 			if tc.expectError {
