@@ -12,6 +12,9 @@ import (
 // addFile copies a file from the repository to the temp directory to prepare to be sent to the ArgoCD API.
 func addFile(repoRoot string, tempDir string, relPath string) error {
 	absDepPath := filepath.Clean(filepath.Join(repoRoot, relPath))
+	if err := insideRepo(absDepPath, repoRoot); err != nil {
+		return err
+	}
 
 	// Get relative path from repo root
 	relPath, err := filepath.Rel(repoRoot, absDepPath)
